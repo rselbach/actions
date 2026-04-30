@@ -1,0 +1,288 @@
+name: Pi Release Notes
+description: Generate Markdown release notes from git history using pi and an LLM.
+
+inputs:
+  project-name:
+    description: Project name to use in the release notes prompt.
+    required: true
+  project-description:
+    description: Short project description to use in the release notes prompt.
+    required: true
+  current-tag:
+    description: Current release tag. Defaults to GITHUB_REF_NAME.
+    required: false
+    default: ''
+  previous-tag:
+    description: Previous release tag. If omitted, the action finds the nearest previous matching tag.
+    required: false
+    default: ''
+  tag-prefix:
+    description: Tag prefix used when auto-detecting the previous tag.
+    required: false
+    default: v
+  tag-pattern:
+    description: Git tag glob used when auto-detecting the previous tag. Overrides tag-prefix when set.
+    required: false
+    default: ''
+  output-file:
+    description: Path where the generated Markdown release notes should be written.
+    required: false
+    default: build/release-notes.md
+  prompt-file:
+    description: Optional path to a custom prompt file. Defaults to the bundled prompt.
+    required: false
+    default: ''
+  additional-context:
+    description: Optional extra maintainer context to include in the model input.
+    required: false
+    default: ''
+  additional-context-file:
+    description: Optional path to a file containing extra maintainer context.
+    required: false
+    default: ''
+  provider:
+    description: pi provider name. Leave empty when the model value includes the provider prefix.
+    required: false
+    default: deepseek
+  model:
+    description: pi model name or provider/model pattern.
+    required: false
+    default: deepseek-v4-flash
+  thinking:
+    description: pi thinking level.
+    required: false
+    default: 'off'
+  pi-version:
+    description: Version of @mariozechner/pi-coding-agent to install.
+    required: false
+    default: 0.70.2
+  node-version:
+    description: Node.js version used to install and run pi.
+    required: false
+    default: '22'
+
+outputs:
+  body-path:
+    description: Path to the generated Markdown release notes.
+    value: ${{ steps.generate.outputs.body-path }}
+  current-tag:
+    description: Current release tag used for the release notes.
+    value: ${{ steps.range.outputs.current-tag }}
+  previous-tag:
+    description: Previous release tag used for the release notes.
+    value: ${{ steps.range.outputs.previous-tag }}
+  range:
+    description: Git revision range used for the release notes.
+    value: ${{ steps.range.outputs.range }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install pi
+      shell: bash
+      env:
+        PI_VERSION: ${{ inputs.pi-version }}
+      run: npm install -g "@mariozechner/pi-coding-agent@${PI_VERSION}"
+
+    - name: Resolve release range
+      id: range
+      shell: bash
+      env:
+        INPUT_CURRENT_TAG: ${{ inputs.current-tag }}
+        INPUT_PREVIOUS_TAG: ${{ inputs.previous-tag }}
+        INPUT_TAG_PREFIX: ${{ inputs.tag-prefix }}
+        INPUT_TAG_PATTERN: ${{ inputs.tag-pattern }}
+      run: |
+        set -euo pipefail
+
+        if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+          echo "pi-release-notes must run inside a git checkout" >&2
+          exit 1
+        fi
+
+        git fetch --force --tags origin 'refs/tags/*:refs/tags/*' >/dev/null 2>&1 || true
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          git fetch --unshallow --tags >/dev/null 2>&1 ||
+            git fetch --depth=1000 --tags >/dev/null 2>&1 ||
+            true
+        fi
+
+        current_tag="${INPUT_CURRENT_TAG}"
+        if [ -z "${current_tag}" ]; then
+          current_tag="${GITHUB_REF_NAME:-}"
+        fi
+        if [ -z "${current_tag}" ]; then
+          current_tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+        fi
+        if [ -z "${current_tag}" ]; then
+          echo "Unable to determine current tag. Set the current-tag input." >&2
+          exit 1
+        fi
+        if ! git rev-parse -q --verify "refs/tags/${current_tag}" >/dev/null; then
+          echo "Current tag ${current_tag} was not found in this checkout" >&2
+          exit 1
+        fi
+
+        current_sha="$(git rev-list -n 1 "${current_tag}")"
+        previous_tag="${INPUT_PREVIOUS_TAG}"
+
+        if [ -z "${previous_tag}" ]; then
+          tag_pattern="${INPUT_TAG_PATTERN}"
+          if [ -z "${tag_pattern}" ]; then
+            if [ -n "${INPUT_TAG_PREFIX}" ]; then
+              tag_pattern="${INPUT_TAG_PREFIX}*"
+            else
+              tag_pattern="*"
+            fi
+          fi
+
+          if git rev-parse -q --verify "${current_sha}^" >/dev/null; then
+            previous_tag="$(
+              git tag --list "${tag_pattern}" --merged "${current_sha}^" --sort=-version:refname |
+                grep -v -x "${current_tag}" |
+                head -n1 ||
+                true
+            )"
+          fi
+        fi
+
+        if [ -n "${previous_tag}" ] &&
+          ! git rev-parse -q --verify "refs/tags/${previous_tag}" >/dev/null; then
+          echo "Previous tag ${previous_tag} was not found in this checkout" >&2
+          exit 1
+        fi
+
+        if [ -n "${previous_tag}" ]; then
+          range="${previous_tag}..${current_tag}"
+          diff_base="${previous_tag}"
+        else
+          range="${current_tag}"
+          diff_base="$(git hash-object -t tree /dev/null)"
+        fi
+
+        {
+          echo "current-tag=${current_tag}"
+          echo "previous-tag=${previous_tag}"
+          echo "range=${range}"
+          echo "diff-base=${diff_base}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - name: Build release notes input
+      id: context
+      shell: bash
+      env:
+        PROJECT_NAME: ${{ inputs.project-name }}
+        PROJECT_DESCRIPTION: ${{ inputs.project-description }}
+        PROMPT_FILE: ${{ inputs.prompt-file }}
+        ADDITIONAL_CONTEXT: ${{ inputs.additional-context }}
+        ADDITIONAL_CONTEXT_FILE: ${{ inputs.additional-context-file }}
+        CURRENT_TAG: ${{ steps.range.outputs.current-tag }}
+        PREVIOUS_TAG: ${{ steps.range.outputs.previous-tag }}
+        RANGE: ${{ steps.range.outputs.range }}
+        DIFF_BASE: ${{ steps.range.outputs.diff-base }}
+      run: |
+        set -euo pipefail
+
+        input_file="${RUNNER_TEMP}/pi-release-notes-input.md"
+        prompt_file="${PROMPT_FILE}"
+        if [ -z "${prompt_file}" ]; then
+          prompt_file="${GITHUB_ACTION_PATH}/release-notes-prompt.md"
+        fi
+        if [ ! -f "${prompt_file}" ]; then
+          echo "Prompt file ${prompt_file} does not exist" >&2
+          exit 1
+        fi
+
+        {
+          cat "${prompt_file}"
+          echo
+          echo "Use the actual release input below."
+          echo
+          echo "Project:"
+          echo "${PROJECT_NAME}"
+          echo
+          echo "Project description:"
+          echo "${PROJECT_DESCRIPTION}"
+          echo
+          echo "Previous version:"
+          if [ -n "${PREVIOUS_TAG}" ]; then
+            echo "${PREVIOUS_TAG}"
+          else
+            echo "none"
+          fi
+          echo
+          echo "New version:"
+          echo "${CURRENT_TAG}"
+          echo
+          echo "Git range:"
+          echo "${RANGE}"
+          echo
+          echo "Commits:"
+          git log --reverse --format='- %s (%h)' "${RANGE}"
+          echo
+          echo "Changed files:"
+          git diff --name-status "${DIFF_BASE}" "${CURRENT_TAG}"
+          echo
+          echo "Diffstat:"
+          git diff --stat "${DIFF_BASE}" "${CURRENT_TAG}"
+
+          if [ -n "${ADDITIONAL_CONTEXT}" ]; then
+            echo
+            echo "Additional maintainer context:"
+            echo "${ADDITIONAL_CONTEXT}"
+          fi
+
+          if [ -n "${ADDITIONAL_CONTEXT_FILE}" ]; then
+            if [ ! -f "${ADDITIONAL_CONTEXT_FILE}" ]; then
+              echo "Additional context file ${ADDITIONAL_CONTEXT_FILE} does not exist" >&2
+              exit 1
+            fi
+            echo
+            echo "Additional maintainer context file:"
+            cat "${ADDITIONAL_CONTEXT_FILE}"
+          fi
+        } > "${input_file}"
+
+        echo "input-file=${input_file}" >> "${GITHUB_OUTPUT}"
+
+    - name: Generate release notes
+      id: generate
+      shell: bash
+      env:
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_THINKING: ${{ inputs.thinking }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+        INPUT_FILE: ${{ steps.context.outputs.input-file }}
+        PI_TELEMETRY: '0'
+      run: |
+        set -euo pipefail
+
+        mkdir -p "$(dirname "${OUTPUT_FILE}")"
+
+        pi_args=(
+          --model "${INPUT_MODEL}"
+          --thinking "${INPUT_THINKING}"
+          --no-tools
+          --no-session
+          --no-context-files
+          --no-extensions
+          --no-skills
+          --no-prompt-templates
+          --no-themes
+          -p "Generate the release notes from stdin. Return only Markdown."
+        )
+
+        if [ -n "${INPUT_PROVIDER}" ]; then
+          pi_args=(--provider "${INPUT_PROVIDER}" "${pi_args[@]}")
+        fi
+
+        pi "${pi_args[@]}" < "${INPUT_FILE}" > "${OUTPUT_FILE}"
+        test -s "${OUTPUT_FILE}"
+
+        echo "body-path=${OUTPUT_FILE}" >> "${GITHUB_OUTPUT}"
