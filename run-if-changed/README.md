@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - id: changes
-        uses: rselbach/actions/run-if-changed@v1
+        uses: rselbach/actions/run-if-changed@run-if-changed-v1
         with:
           filters: |
             backend:

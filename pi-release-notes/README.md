@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
 
       - id: release_notes
-        uses: rselbach/actions/pi-release-notes@v1
+        uses: rselbach/actions/pi-release-notes@pi-release-notes-v1
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         with:
