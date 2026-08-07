@@ -1,0 +1,75 @@
+name: Verify run-if-changed
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'run-if-changed/**'
+      - '.github/workflows/run-if-changed.yml'
+  pull_request:
+    paths:
+      - 'run-if-changed/**'
+      - '.github/workflows/run-if-changed.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: run-if-changed
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: run-if-changed/package-lock.json
+      - run: npm ci
+      - run: npm run all
+      - name: Check generated bundle
+        run: |
+          if [[ -n "$(git diff --name-only -- dist/)" ]]; then
+            echo 'dist/index.js is out of date; run npm run all in run-if-changed' >&2
+            git diff --stat -- dist/
+            exit 1
+          fi
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Create local changes
+        run: |
+          mkdir -p smoke/mobile
+          printf '%s\n' 'console.log("Troy and Abed in the morning")' > smoke/mobile/main.js
+          printf '%s\n' '# Greendale' > smoke/mobile/README.md
+          git add smoke
+      - uses: ./run-if-changed
+        id: filter
+        with:
+          base: HEAD
+          list-files: json
+          predicate-quantifier: some-with-excludes
+          filters: |
+            mobile:
+              - 'smoke/mobile/**'
+              - '!smoke/mobile/**/*.md'
+      - name: Verify outputs
+        env:
+          FILTER_OUTPUTS: ${{ toJSON(steps.filter.outputs) }}
+        run: |
+          node <<'NODE'
+          const outputs = JSON.parse(process.env.FILTER_OUTPUTS)
+          const want = {
+            mobile: 'true',
+            mobile_count: '1',
+            mobile_files: '["smoke/mobile/main.js"]',
+            changes: '["mobile"]'
+          }
+          for (const [name, value] of Object.entries(want)) {
+            if (outputs[name] !== value) {
+              console.error(`unexpected ${name} output: ${outputs[name]}`)
+              process.exit(1)
+            }
+          }
+          NODE
